@@ -38,6 +38,7 @@ APPS_YAML="${REPO_ROOT}/saas_bench/apps.yaml"
 NO_ISOLATION=""
 TASK_IDS=""
 LOG_FILE=""
+RERUN_EXISTING=""
 
 # -- Argument parsing --------------------------------------------------------
 usage() {
@@ -54,6 +55,7 @@ Options:
   --apps-yaml <path>      Path to apps.yaml (default: rollout/apps.yaml)
   --no-isolation          Disable Docker container isolation; connect directly to already-running apps via fixed_port
   --task-ids <id> [...]   Run only the specified task ids (space-separated)
+  --rerun-existing        Re-run tasks even if their result JSON files already exist
   --log <file>            Also write output to a log file
   -h, --help              Show this help
 EOF
@@ -70,6 +72,7 @@ while [[ $# -gt 0 ]]; do
         --result-dir)  RESULT_DIR="$2";      shift 2 ;;
         --apps-yaml)   APPS_YAML="$2";       shift 2 ;;
         --no-isolation) NO_ISOLATION="--no-isolation"; shift ;;
+        --rerun-existing) RERUN_EXISTING="--rerun-existing"; shift ;;
         --task-ids)
             shift
             TASK_IDS=""
@@ -141,6 +144,7 @@ CMD=(
 )
 
 [[ -n "$NO_ISOLATION" ]] && CMD+=("$NO_ISOLATION")
+[[ -n "$RERUN_EXISTING" ]] && CMD+=("$RERUN_EXISTING")
 
 if [[ -n "$TASK_IDS" ]]; then
     CMD+=(--task-ids)

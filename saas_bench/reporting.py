@@ -100,6 +100,106 @@ def _step_stats_dict(steps: list[int]) -> dict:
     }
 
 
+_LLM_COUNT_KEYS = ("llm_call_count", "usage_call_count", "priced_call_count", "unpriced_call_count")
+_LLM_TOKEN_KEYS = (
+    "prompt_tokens",
+    "prompt_cached_tokens",
+    "prompt_cache_creation_tokens",
+    "prompt_image_tokens",
+    "completion_tokens",
+    "total_tokens",
+)
+
+
+def _safe_int(value) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _safe_float(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _new_llm_bucket() -> dict:
+    bucket = {key: 0 for key in _LLM_COUNT_KEYS + _LLM_TOKEN_KEYS}
+    bucket.update({
+        "spending_usd": 0.0,
+        "priced_task_runs": 0,
+        "unpriced_task_runs": 0,
+    })
+    return bucket
+
+
+def _llm_usage(records: list[dict]) -> dict:
+    summary = _new_llm_bucket()
+    summary["task_runs"] = len(records)
+    summary["missing_stats_task_runs"] = 0
+    by_model: dict[str, dict] = defaultdict(_new_llm_bucket)
+
+    for record in records:
+        agent = record.get("agent", {})
+        stats = agent.get("llm_stats") if isinstance(agent, dict) else None
+        if not isinstance(stats, dict):
+            summary["missing_stats_task_runs"] += 1
+            continue
+
+        model = str(stats.get("model") or "unknown")
+        model_bucket = by_model[model]
+        for key in _LLM_COUNT_KEYS + _LLM_TOKEN_KEYS:
+            value = _safe_int(stats.get(key))
+            summary[key] += value
+            model_bucket[key] += value
+
+        spending = _safe_float(stats.get("spending_usd"))
+        if spending is not None:
+            summary["spending_usd"] += spending
+            summary["priced_task_runs"] += 1
+            model_bucket["spending_usd"] += spending
+            model_bucket["priced_task_runs"] += 1
+        elif _safe_int(stats.get("usage_call_count")) > 0:
+            summary["unpriced_task_runs"] += 1
+            model_bucket["unpriced_task_runs"] += 1
+
+    for bucket in [summary, *by_model.values()]:
+        bucket["spending_usd"] = round(bucket["spending_usd"], 6)
+        bucket["spending_is_partial"] = (
+            bucket.get("unpriced_task_runs", 0) > 0
+            or (
+                bucket is summary
+                and summary.get("missing_stats_task_runs", 0) > 0
+            )
+        )
+
+    summary["by_model"] = dict(sorted(by_model.items()))
+    return summary
+
+
+def summarize_llm_usage_from_files(
+    result_dir: Path,
+    task_ids: list[str],
+    run_indices: list[int],
+) -> dict:
+    """Aggregate LLM stats from agent result JSON files."""
+    records: list[dict] = []
+    for tid in task_ids:
+        for run_idx in run_indices:
+            suffix = f"_r{run_idx}"
+            agent = (
+                _safe_load(result_dir / f"{tid}{suffix}.json")
+                or (run_idx == 0 and _safe_load(result_dir / f"{tid}.json"))
+                or {"task_id": tid, "status": "missing", "trajectory": [], "agent_output": ""}
+            )
+            records.append({"agent": agent})
+    return _llm_usage(records)
+
+
 # ---------------------------------------------------------------------------
 # pass@k and per-task aggregation
 # ---------------------------------------------------------------------------
@@ -515,6 +615,26 @@ def _md_overall(s: dict) -> str:
     return "\n".join(lines) + "\n\n"
 
 
+def _md_llm_usage(s: dict) -> str:
+    usage = s.get("llm_usage", {})
+    spending = usage.get("spending_usd", 0.0)
+    spending_label = f"${spending:.6f}"
+    if usage.get("spending_is_partial"):
+        spending_label += " (partial)"
+    return (
+        "## LLM Usage\n\n"
+        "| Metric | Value |\n"
+        "|--------|------:|\n"
+        f"| LLM calls | {usage.get('llm_call_count', 0)} |\n"
+        f"| Calls with token usage | {usage.get('usage_call_count', 0)} |\n"
+        f"| Prompt tokens | {usage.get('prompt_tokens', 0)} |\n"
+        f"| Completion tokens | {usage.get('completion_tokens', 0)} |\n"
+        f"| Total tokens | {usage.get('total_tokens', 0)} |\n"
+        f"| Estimated spending | {spending_label} |\n"
+        f"| Missing per-task stats | {usage.get('missing_stats_task_runs', 0)} |\n\n"
+    )
+
+
 def _md_by_domain(s: dict) -> str:
     runs = s["overall"]["runs"]
     # build header
@@ -693,6 +813,7 @@ def _render_report(summary: dict) -> str:
     )
     body = (
         _md_overall(summary)
+        + _md_llm_usage(summary)
         + _md_by_domain(summary)
         + _md_by_app(summary)
         + _md_steps(summary)
@@ -735,6 +856,7 @@ def generate_outputs(
             "duration_human": _human_duration(run_meta.get("duration_s") or 0),
         },
         "overall":           _overall(task_aggs, runs),
+        "llm_usage":         _llm_usage(records),
         "by_domain":         _by_domain(task_aggs, records, runs),
         "by_app":            _by_app(task_aggs, records, runs),
         "steps":             _step_stats(task_aggs, records),

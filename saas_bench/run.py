@@ -23,7 +23,7 @@ import yaml
 
 from saas_bench.agent import run_task
 from saas_bench.loader import build_prompt, load_tasks
-from saas_bench.reporting import generate_outputs
+from saas_bench.reporting import generate_outputs, summarize_llm_usage_from_files
 from saas_bench.slot import SlotManager
 from saas_bench.verify_runner import run_verify
 
@@ -89,6 +89,47 @@ def _log_error(result_dir: str, slot_id: int, task_id: str, phase: str, exc: Exc
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with open(log_path, "a") as f:
         f.write(entry)
+
+
+def _safe_json_exists(path: Path) -> bool:
+    """True when path exists and contains parseable JSON."""
+    if not path.exists():
+        return False
+    try:
+        json.loads(path.read_text())
+        return True
+    except (json.JSONDecodeError, OSError):
+        return False
+
+
+def _agent_result_exists(result_dir: Path, task_id: str, run_idx: int) -> bool:
+    """Return whether an agent result already exists for this task/run."""
+    paths = [result_dir / f"{task_id}_r{run_idx}.json"]
+    if run_idx == 0:
+        # Backwards compatibility with older suffix-free result files.
+        paths.append(result_dir / f"{task_id}.json")
+    return any(_safe_json_exists(path) for path in paths)
+
+
+def _print_llm_usage(llm_usage: dict) -> None:
+    spending = llm_usage.get("spending_usd", 0.0)
+    spending_label = f"${spending:.6f}"
+    if llm_usage.get("spending_is_partial"):
+        spending_label += " (partial; some task runs are missing pricing/stats)"
+
+    print("\n=== LLM usage ===", flush=True)
+    print(
+        f"  Calls : {llm_usage.get('llm_call_count', 0)} "
+        f"({llm_usage.get('usage_call_count', 0)} with token usage)",
+        flush=True,
+    )
+    print(
+        f"  Tokens: prompt={llm_usage.get('prompt_tokens', 0)} | "
+        f"completion={llm_usage.get('completion_tokens', 0)} | "
+        f"total={llm_usage.get('total_tokens', 0)}",
+        flush=True,
+    )
+    print(f"  Spending: {spending_label}", flush=True)
 
 
 def _run_one(
@@ -177,7 +218,7 @@ def _run_one(
     }
 
 
-def _run_task_all_runs(
+def _run_task_runs(
     task: dict,
     slot_id: int,
     apps_config: dict,
@@ -186,18 +227,17 @@ def _run_task_all_runs(
     max_steps: int,
     hostname: str,
     use_isolation: bool,
-    run_start: int = 0,
-    runs: int = 1,
+    run_indices: list[int],
     tasks_dir: str = "",
-) -> list[dict]:
-    """All runs of a single task execute serially on the same slot, avoiding slot contention between runs."""
+) -> list[tuple[int, dict]]:
+    """Selected runs of a single task execute serially on the same slot."""
     results = []
-    for run_idx in range(run_start, run_start + runs):
+    for run_idx in run_indices:
         result = _run_one(
             task, slot_id, apps_config, model, result_dir,
             max_steps, hostname, use_isolation, run_idx, tasks_dir,
         )
-        results.append(result)
+        results.append((run_idx, result))
     return results
 
 
@@ -214,6 +254,7 @@ def main(
     runs: int = 1,
     run_start: int = 0,
     write_report: bool = True,
+    rerun_existing: bool = False,
 ) -> None:
     _global_cleanup()
     started_at = datetime.now()
@@ -230,9 +271,25 @@ def main(
 
     apps_config = _load_apps_config(apps_yaml)
 
-    total_jobs = len(tasks) * runs
+    run_indices = list(range(run_start, run_start + runs))
+    result_path = Path(result_dir)
+    pending_jobs: list[tuple[dict, list[int]]] = []
+    skipped_jobs = 0
+    for task in tasks:
+        task_run_indices = [
+            run_idx
+            for run_idx in run_indices
+            if rerun_existing or not _agent_result_exists(result_path, str(task["task_id"]), run_idx)
+        ]
+        skipped_jobs += len(run_indices) - len(task_run_indices)
+        if task_run_indices:
+            pending_jobs.append((task, task_run_indices))
+
+    requested_jobs = len(tasks) * runs
+    total_jobs = sum(len(run_indices_for_task) for _, run_indices_for_task in pending_jobs)
     print(
-        f"Loaded {len(tasks)} tasks × runs={runs} (r{run_start}..r{run_start+runs-1}) = {total_jobs} jobs | "
+        f"Loaded {len(tasks)} tasks × runs={runs} (r{run_start}..r{run_start+runs-1}) = {requested_jobs} requested jobs | "
+        f"pending={total_jobs} skipped_existing={skipped_jobs} | "
         f"workers={workers} | model={model} | isolation={use_isolation}",
         flush=True,
     )
@@ -242,31 +299,34 @@ def main(
     # This guarantees no two concurrent jobs ever share a slot.
     task_results: list[tuple[dict, int, dict | Exception]] = []
 
-    with ProcessPoolExecutor(max_workers=workers) as pool:
-        futures = {
-            pool.submit(
-                _run_task_all_runs, task,
-                i % workers,
-                apps_config, model,
-                result_dir, max_steps, hostname, use_isolation,
-                run_start, runs, tasks_dir,
-            ): task
-            for i, task in enumerate(tasks)
-        }
-        for fut in as_completed(futures):
-            task = futures[fut]
-            try:
-                for run_idx, result in enumerate(fut.result(), start=run_start):
-                    task_results.append((task, run_idx, result))
-            except Exception as e:
-                _log_error(result_dir, -1, task.get("task_id", "?"), "worker", e)
-                print(
-                    f"  [{task.get('task_id','?')}] WORKER EXCEPTION: "
-                    f"{type(e).__name__}: {str(e)[:200]}",
-                    flush=True,
-                )
-                for run_idx in range(run_start, run_start + runs):
-                    task_results.append((task, run_idx, e))
+    if pending_jobs:
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(
+                    _run_task_runs, task,
+                    i % workers,
+                    apps_config, model,
+                    result_dir, max_steps, hostname, use_isolation,
+                    task_run_indices, tasks_dir,
+                ): (task, task_run_indices)
+                for i, (task, task_run_indices) in enumerate(pending_jobs)
+            }
+            for fut in as_completed(futures):
+                task, task_run_indices = futures[fut]
+                try:
+                    for run_idx, result in fut.result():
+                        task_results.append((task, run_idx, result))
+                except Exception as e:
+                    _log_error(result_dir, -1, task.get("task_id", "?"), "worker", e)
+                    print(
+                        f"  [{task.get('task_id','?')}] WORKER EXCEPTION: "
+                        f"{type(e).__name__}: {str(e)[:200]}",
+                        flush=True,
+                    )
+                    for run_idx in task_run_indices:
+                        task_results.append((task, run_idx, e))
+    else:
+        print("No pending task results; all selected task JSON files already exist.", flush=True)
 
     ended_at = datetime.now()
     duration_s = round(time.perf_counter() - t0, 1)
@@ -309,6 +369,13 @@ def main(
     print(f"  Total : {total_completed}/{total_jobs_done} (tasks={len(tasks)}, runs={runs})", flush=True)
 
     Path(result_dir).mkdir(parents=True, exist_ok=True)
+    llm_usage = summarize_llm_usage_from_files(
+        result_path,
+        [str(task["task_id"]) for task in tasks],
+        run_indices,
+    )
+    _print_llm_usage(llm_usage)
+
     run_meta = {
         "tasks_dir":  tasks_dir,
         "model":      model,
@@ -356,6 +423,8 @@ def parse_args() -> argparse.Namespace:
                    help="Starting run_idx; output file suffix is _r{run_start}.._r{run_start+runs-1} (used when re-running specific runs)")
     p.add_argument("--no-report", action="store_true",
                    help="Skip re-generating summary.json/report.md (avoids overwriting existing aggregates when re-running partial runs)")
+    p.add_argument("--rerun-existing", action="store_true",
+                   help="Run selected tasks even when their result JSON files already exist")
     return p.parse_args()
 
 
@@ -374,4 +443,5 @@ if __name__ == "__main__":
         runs         = args.runs,
         run_start    = args.run_start,
         write_report = not args.no_report,
+        rerun_existing = args.rerun_existing,
     )

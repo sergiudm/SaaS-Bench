@@ -19,7 +19,7 @@ from pathlib import Path
 import httpx
 from browser_use import Agent, Browser, ChatOpenAI
 from browser_use.tools.service import Tools
-from browser_use.llm.views import ChatInvokeCompletion
+from browser_use.llm.views import ChatInvokeCompletion, ChatInvokeUsage
 from playwright.async_api import async_playwright
 from typing import Any
 
@@ -272,6 +272,7 @@ def _rewrite_banned_actions(text: str) -> str:
 # ContextVar that each httpx response hook writes the request id into.
 # One slot per async task — safe under concurrent workers.
 _current_request_id: ContextVar[str | None] = ContextVar("_current_request_id", default=None)
+_current_response_usage: ContextVar[ChatInvokeUsage | None] = ContextVar("_current_response_usage", default=None)
 
 
 # Header names that providers use for the per-call request id.  Listed in
@@ -288,14 +289,213 @@ _REQUEST_ID_HEADERS = (
 
 
 def _make_request_id_hook():
-    """Return an httpx event hook that captures the request id into the ContextVar."""
+    """Return an httpx event hook that captures request metadata into ContextVars."""
     async def _capture(response: httpx.Response) -> None:
         for name in _REQUEST_ID_HEADERS:
             rid = response.headers.get(name)
             if rid:
                 _current_request_id.set(rid)
-                return
+                break
+
+        usage = await _usage_from_response(response)
+        if usage is not None:
+            _current_response_usage.set(usage)
     return _capture
+
+
+def _int_or_none(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _usage_from_payload(payload: Any) -> ChatInvokeUsage | None:
+    if not isinstance(payload, dict):
+        return None
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        return None
+
+    prompt_tokens = _int_or_none(
+        usage.get("prompt_tokens", usage.get("input_tokens"))
+    )
+    completion_tokens = _int_or_none(
+        usage.get("completion_tokens", usage.get("output_tokens"))
+    )
+    total_tokens = _int_or_none(usage.get("total_tokens"))
+
+    if prompt_tokens is None and completion_tokens is None and total_tokens is None:
+        return None
+    prompt_tokens = prompt_tokens or 0
+    completion_tokens = completion_tokens or 0
+    total_tokens = total_tokens if total_tokens is not None else prompt_tokens + completion_tokens
+
+    prompt_details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details")
+    prompt_cached_tokens = usage.get("prompt_cached_tokens")
+    if prompt_cached_tokens is None and isinstance(prompt_details, dict):
+        prompt_cached_tokens = prompt_details.get("cached_tokens")
+
+    return ChatInvokeUsage(
+        prompt_tokens=prompt_tokens,
+        prompt_cached_tokens=_int_or_none(prompt_cached_tokens),
+        prompt_cache_creation_tokens=_int_or_none(
+            usage.get("prompt_cache_creation_tokens")
+            or usage.get("cache_creation_input_tokens")
+        ),
+        prompt_image_tokens=_int_or_none(usage.get("prompt_image_tokens")),
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+    )
+
+
+async def _usage_from_response(response: httpx.Response) -> ChatInvokeUsage | None:
+    try:
+        await response.aread()
+        payload = json.loads(response.content.decode(response.encoding or "utf-8"))
+    except Exception:
+        return None
+    return _usage_from_payload(payload)
+
+
+@_dataclass(frozen=True)
+class _ModelPricing:
+    input_per_1m_tokens_usd: float
+    output_per_1m_tokens_usd: float
+    cached_input_per_1m_tokens_usd: float | None = None
+    cache_creation_input_per_1m_tokens_usd: float | None = None
+    source: str = "unknown"
+
+
+_BUILTIN_PRICING: dict[str, _ModelPricing] = {
+    "claude-opus-4-6": _ModelPricing(5.0, 25.0, 0.50, source="built_in"),
+    "claude-opus-4.6": _ModelPricing(5.0, 25.0, 0.50, source="built_in"),
+    "claude-sonnet-4-6": _ModelPricing(3.0, 15.0, 0.30, source="built_in"),
+    "claude-sonnet-4.6": _ModelPricing(3.0, 15.0, 0.30, source="built_in"),
+    "gemini-2.0-flash": _ModelPricing(0.15, 0.60, source="built_in"),
+    "gemini-3-flash-preview": _ModelPricing(0.50, 3.00, 0.05, source="built_in"),
+    "gemini-3.5-flash": _ModelPricing(1.50, 9.00, source="built_in"),
+    "qwen3.6-plus": _ModelPricing(0.33, 1.95, source="built_in"),
+    "qwen/qwen3.6-plus": _ModelPricing(0.33, 1.95, source="built_in"),
+}
+
+
+def _float_env(*names: str) -> float | None:
+    for name in names:
+        raw = os.environ.get(name)
+        if raw is None or not raw.strip():
+            continue
+        try:
+            return float(raw)
+        except ValueError:
+            continue
+    return None
+
+
+def _pricing_for_model(model_name: str) -> _ModelPricing | None:
+    env_input = _float_env("LLM_INPUT_PRICE_PER_1M_TOKENS", "LLM_INPUT_COST_PER_1M_TOKENS")
+    env_output = _float_env("LLM_OUTPUT_PRICE_PER_1M_TOKENS", "LLM_OUTPUT_COST_PER_1M_TOKENS")
+    if env_input is not None and env_output is not None:
+        return _ModelPricing(
+            input_per_1m_tokens_usd=env_input,
+            output_per_1m_tokens_usd=env_output,
+            cached_input_per_1m_tokens_usd=_float_env(
+                "LLM_CACHED_INPUT_PRICE_PER_1M_TOKENS",
+                "LLM_CACHED_INPUT_COST_PER_1M_TOKENS",
+            ),
+            cache_creation_input_per_1m_tokens_usd=_float_env(
+                "LLM_CACHE_CREATION_INPUT_PRICE_PER_1M_TOKENS",
+                "LLM_CACHE_CREATION_INPUT_COST_PER_1M_TOKENS",
+            ),
+            source="env",
+        )
+
+    normalized = model_name.lower()
+    if ":" in normalized:
+        base, suffix = normalized.rsplit(":", 1)
+        if suffix in {"minimal", "low", "medium", "high"}:
+            normalized = base
+    return _BUILTIN_PRICING.get(normalized)
+
+
+def _pricing_to_dict(pricing: _ModelPricing | None) -> dict:
+    if pricing is None:
+        return {
+            "source": "unavailable",
+            "reason": (
+                "Set LLM_INPUT_PRICE_PER_1M_TOKENS and "
+                "LLM_OUTPUT_PRICE_PER_1M_TOKENS to enable spending estimates."
+            ),
+        }
+    return {
+        "source": pricing.source,
+        "input_per_1m_tokens_usd": pricing.input_per_1m_tokens_usd,
+        "output_per_1m_tokens_usd": pricing.output_per_1m_tokens_usd,
+        "cached_input_per_1m_tokens_usd": pricing.cached_input_per_1m_tokens_usd,
+        "cache_creation_input_per_1m_tokens_usd": pricing.cache_creation_input_per_1m_tokens_usd,
+    }
+
+
+def _usage_to_dict(usage: ChatInvokeUsage | None) -> dict | None:
+    if usage is None:
+        return None
+    return {
+        "prompt_tokens": usage.prompt_tokens,
+        "prompt_cached_tokens": usage.prompt_cached_tokens or 0,
+        "prompt_cache_creation_tokens": usage.prompt_cache_creation_tokens or 0,
+        "prompt_image_tokens": usage.prompt_image_tokens or 0,
+        "completion_tokens": usage.completion_tokens,
+        "total_tokens": usage.total_tokens,
+    }
+
+
+def _spending_for_usage(usage: ChatInvokeUsage | None, pricing: _ModelPricing | None) -> float | None:
+    if usage is None or pricing is None:
+        return None
+
+    cached_tokens = max(usage.prompt_cached_tokens or 0, 0)
+    uncached_prompt_tokens = max(usage.prompt_tokens - cached_tokens, 0)
+    cache_creation_tokens = max(usage.prompt_cache_creation_tokens or 0, 0)
+    cached_price = (
+        pricing.cached_input_per_1m_tokens_usd
+        if pricing.cached_input_per_1m_tokens_usd is not None
+        else pricing.input_per_1m_tokens_usd
+    )
+    cache_creation_price = (
+        pricing.cache_creation_input_per_1m_tokens_usd
+        if pricing.cache_creation_input_per_1m_tokens_usd is not None
+        else pricing.input_per_1m_tokens_usd
+    )
+
+    total = (
+        uncached_prompt_tokens * pricing.input_per_1m_tokens_usd
+        + cached_tokens * cached_price
+        + cache_creation_tokens * cache_creation_price
+        + usage.completion_tokens * pricing.output_per_1m_tokens_usd
+    ) / 1_000_000
+    return total
+
+
+def _empty_llm_stats(model_name: str) -> dict:
+    pricing = _pricing_for_model(model_name)
+    return {
+        "model": model_name,
+        "llm_call_count": 0,
+        "usage_call_count": 0,
+        "prompt_tokens": 0,
+        "prompt_cached_tokens": 0,
+        "prompt_cache_creation_tokens": 0,
+        "prompt_image_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "spending_usd": 0.0,
+        "pricing": _pricing_to_dict(pricing),
+        "priced_call_count": 0,
+        "unpriced_call_count": 0,
+        "calls": [],
+    }
 
 
 
@@ -320,6 +520,9 @@ class _CleanOutputChatOpenAI(ChatOpenAI):
 
     def __post_init__(self):
         self.request_ids: list[str | None] = []
+        self.llm_call_records: list[dict] = []
+        self._llm_call_count = 0
+        self._pricing = _pricing_for_model(str(self.model))
         # Build a single reusable httpx.AsyncClient with the capture hook so
         # get_client() returns the same transport every call within this instance.
         self._http_client = httpx.AsyncClient(
@@ -328,28 +531,120 @@ class _CleanOutputChatOpenAI(ChatOpenAI):
         # Inject into the dataclass field that ChatOpenAI.get_client() reads.
         object.__setattr__(self, "http_client", self._http_client)
 
-    async def ainvoke(self, messages, output_format=None, **kwargs) -> Any:
-        # Reset the slot so we get a fresh id for this call.
-        _current_request_id.set(None)
+    async def aclose(self) -> None:
+        await self._http_client.aclose()
 
+    async def _invoke_and_record(
+        self,
+        messages,
+        output_format,
+        call_mode: str,
+        **kwargs,
+    ) -> tuple[ChatInvokeCompletion, dict]:
+        self._llm_call_count += 1
+        call_no = self._llm_call_count
+        _current_request_id.set(None)
+        _current_response_usage.set(None)
+
+        error: str | None = None
+        result: ChatInvokeCompletion | None = None
+        try:
+            result = await super().ainvoke(messages, output_format=output_format, **kwargs)
+            return result, self._record_call(call_no, call_mode, result.usage, None)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            if result is None:
+                self._record_call(call_no, call_mode, _current_response_usage.get(), error)
+
+    def _record_call(
+        self,
+        call_no: int,
+        call_mode: str,
+        usage: ChatInvokeUsage | None,
+        error: str | None,
+    ) -> dict:
+        if usage is None:
+            usage = _current_response_usage.get()
+        usage_dict = _usage_to_dict(usage)
+        spending = _spending_for_usage(usage, self._pricing)
+        record = {
+            "call": call_no,
+            "mode": call_mode,
+            "request_id": _current_request_id.get(),
+            "spending_usd": round(spending, 8) if spending is not None else None,
+        }
+        if usage_dict is not None:
+            record.update(usage_dict)
+        if error:
+            record["error"] = error[:500]
+        self.llm_call_records.append(record)
+        return record
+
+    def usage_summary(self, requested_model: str | None = None) -> dict:
+        totals = {
+            "prompt_tokens": 0,
+            "prompt_cached_tokens": 0,
+            "prompt_cache_creation_tokens": 0,
+            "prompt_image_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+        usage_call_count = 0
+        spending_total = 0.0
+        priced_call_count = 0
+
+        for record in self.llm_call_records:
+            if "total_tokens" not in record:
+                continue
+            usage_call_count += 1
+            for key in totals:
+                totals[key] += int(record.get(key) or 0)
+            if record.get("spending_usd") is not None:
+                priced_call_count += 1
+                spending_total += float(record["spending_usd"])
+
+        summary = {
+            "model": str(self.model),
+            "llm_call_count": len(self.llm_call_records),
+            "usage_call_count": usage_call_count,
+            **totals,
+            "spending_usd": (
+                round(spending_total, 6)
+                if self._pricing is not None or usage_call_count == 0
+                else None
+            ),
+            "pricing": _pricing_to_dict(self._pricing),
+            "priced_call_count": priced_call_count,
+            "unpriced_call_count": usage_call_count - priced_call_count,
+            "calls": self.llm_call_records,
+        }
+        if requested_model and requested_model != str(self.model):
+            summary["requested_model"] = requested_model
+        return summary
+
+    async def ainvoke(self, messages, output_format=None, **kwargs) -> Any:
         if output_format is None:
-            result = await super().ainvoke(messages, output_format=None, **kwargs)
-            self.request_ids.append(_current_request_id.get())
+            result, record = await self._invoke_and_record(
+                messages, None, "raw", **kwargs
+            )
+            self.request_ids.append(record.get("request_id"))
             return result
 
         # Happy path: let parent try first.
         try:
-            result: ChatInvokeCompletion = await super().ainvoke(
-                messages, output_format=output_format, **kwargs
+            result, record = await self._invoke_and_record(
+                messages, output_format, "structured", **kwargs
             )
             if not isinstance(result.completion, str):
-                self.request_ids.append(_current_request_id.get())
+                self.request_ids.append(record.get("request_id"))
                 return result
             # Parent returned raw string (e.g. dont_force_structured_output=True path)
             cleaned = _strip_tool_call_wrapper(result.completion)
             cleaned = _rewrite_banned_actions(cleaned)
             parsed = output_format.model_validate_json(cleaned)
-            self.request_ids.append(_current_request_id.get())
+            self.request_ids.append(record.get("request_id"))
             return ChatInvokeCompletion(
                 completion=parsed,
                 usage=result.usage,
@@ -359,8 +654,8 @@ class _CleanOutputChatOpenAI(ChatOpenAI):
             # Fall through to recovery: re-fetch as raw string and clean.
             pass
 
-        raw_result: ChatInvokeCompletion = await super().ainvoke(
-            messages, output_format=None, **kwargs
+        raw_result, raw_record = await self._invoke_and_record(
+            messages, None, "raw_recovery", **kwargs
         )
         raw_completion = raw_result.completion
         if not isinstance(raw_completion, str):
@@ -369,7 +664,7 @@ class _CleanOutputChatOpenAI(ChatOpenAI):
         cleaned = _strip_tool_call_wrapper(raw_completion)
         cleaned = _rewrite_banned_actions(cleaned)
         parsed = output_format.model_validate_json(cleaned)
-        self.request_ids.append(_current_request_id.get())
+        self.request_ids.append(raw_record.get("request_id"))
         return ChatInvokeCompletion(
             completion=parsed,
             usage=raw_result.usage,
@@ -528,6 +823,7 @@ def _build_llm(model_name: str) -> _CleanOutputChatOpenAI:
         max_retries=5,
         dont_force_structured_output=True,
         add_schema_to_system_prompt=True,
+        frequency_penalty=None,
         **kwargs,
     )
 
@@ -666,6 +962,7 @@ async def run_task(
     chrome_proc = None
     chrome_user_data = None
     browser = None
+    llm: _CleanOutputChatOpenAI | None = None
 
     # Per-task working dir for browser-use file system (todo.md, results.md, etc.)
     workdir = Path(_TMP_BASE) / f"fs_{task_id}_{port}_{int(time.time())}"
@@ -713,6 +1010,7 @@ async def run_task(
             "status": "completed",
             "agent_output": output,
             "trajectory": trajectory,
+            "llm_stats": llm.usage_summary(requested_model=model_name),
         }
 
     except Exception as e:
@@ -722,10 +1020,17 @@ async def run_task(
             "agent_output": "",
             "trajectory": [],
             "error_steps": [str(e)],
+            "llm_stats": (
+                llm.usage_summary(requested_model=model_name)
+                if llm is not None
+                else _empty_llm_stats(model_name)
+            ),
         }
 
     finally:
         await _kill(chrome_proc, browser)
+        if llm is not None:
+            await llm.aclose()
         if chrome_user_data:
             shutil.rmtree(chrome_user_data, ignore_errors=True)
         shutil.rmtree(workdir, ignore_errors=True)

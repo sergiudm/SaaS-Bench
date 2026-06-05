@@ -113,6 +113,10 @@ bash scripts/run.sh --no-isolation                              # reuse already-
 bash scripts/run.sh --log results/run.log                       # also tee to a file
 ```
 
+Reusing the same `--result-dir` and `--model` automatically skips task runs
+that already have a valid `<task_id>_rN.json` result file. Pass
+`--rerun-existing` to overwrite existing task results.
+
 Per-worker the harness:
 1. Picks a slot id and computes app ports `30000 + slot_id*20 + app_index`.
 2. Starts the docker containers / compose stacks for that task's `sites`.
@@ -123,6 +127,13 @@ Per-worker the harness:
 
 Aggregated stats land in `<result_dir>/summary.json`. Errors are appended
 to `<result_dir>/errors.log` without aborting the run.
+
+Each agent result JSON ends with `llm_stats`, including LLM call count,
+token counts, per-call request IDs when available, and estimated spending.
+The run-level `summary.json`, `report.md`, and final console output include
+total LLM usage and spending across the selected task runs. Set
+`LLM_INPUT_PRICE_PER_1M_TOKENS` and `LLM_OUTPUT_PRICE_PER_1M_TOKENS` in
+`.env` when your endpoint uses custom pricing.
 
 When in doubt, you can purge stale containers from a previous (crashed) run:
 
