@@ -132,6 +132,24 @@ def _print_llm_usage(llm_usage: dict) -> None:
     print(f"  Spending: {spending_label}", flush=True)
 
 
+def _load_task_ids_file(task_ids_file: str) -> list[str]:
+    """Load task ids from a file, ignoring blanks and # comments."""
+    path = Path(task_ids_file)
+    if not path.is_file():
+        raise FileNotFoundError(f"Task ids file does not exist: {task_ids_file}")
+
+    task_ids: list[str] = []
+    for line in path.read_text().splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        task_ids.extend(line.replace(",", " ").split())
+
+    if not task_ids:
+        raise ValueError(f"Task ids file is empty: {task_ids_file}")
+    return task_ids
+
+
 def _run_one(
     task: dict,
     slot_id: int,
@@ -248,7 +266,7 @@ def main(
     result_dir: str,
     max_steps: int,
     hostname: str,
-    task_ids: list[str] | None,
+    task_ids_file: str | None,
     apps_yaml: str,
     use_isolation: bool,
     runs: int = 1,
@@ -266,8 +284,20 @@ def main(
     result_dir = str(Path(result_dir) / model_slug)
 
     tasks = load_tasks(tasks_dir)
-    if task_ids:
-        tasks = [t for t in tasks if str(t.get("task_id")) in task_ids]
+    if task_ids_file:
+        task_ids = _load_task_ids_file(task_ids_file)
+        task_id_set = set(task_ids)
+        tasks = [t for t in tasks if str(t.get("task_id")) in task_id_set]
+        found_ids = {str(t.get("task_id")) for t in tasks}
+        missing_ids = [task_id for task_id in task_ids if task_id not in found_ids]
+        if missing_ids:
+            print(
+                f"[task-ids] warning: {len(missing_ids)} ids from {task_ids_file} were not found: "
+                f"{', '.join(missing_ids[:20])}{' ...' if len(missing_ids) > 20 else ''}",
+                flush=True,
+            )
+        if not tasks:
+            raise ValueError(f"No tasks matched ids from {task_ids_file}")
 
     apps_config = _load_apps_config(apps_yaml)
 
@@ -378,6 +408,7 @@ def main(
 
     run_meta = {
         "tasks_dir":  tasks_dir,
+        "task_ids_file": task_ids_file,
         "model":      model,
         "workers":    workers,
         "hostname":   hostname,
@@ -413,7 +444,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-steps", type=int, default=400)
     p.add_argument("--hostname", default="localhost",
                    help="Hostname the agent uses to access apps")
-    p.add_argument("--task-ids", nargs="*", help="Run only the specified subset of task ids")
+    p.add_argument("--task-ids", dest="task_ids_file", metavar="PATH",
+                   help="Path to a file containing task ids to run")
     p.add_argument("--apps-yaml", default="saas_bench/apps.yaml")
     p.add_argument("--no-isolation", action="store_true",
                    help="Do not start Docker container isolation (share already-running apps)")
@@ -437,7 +469,7 @@ if __name__ == "__main__":
         result_dir   = args.result_dir,
         max_steps    = args.max_steps,
         hostname     = args.hostname,
-        task_ids     = args.task_ids,
+        task_ids_file= args.task_ids_file,
         apps_yaml    = args.apps_yaml,
         use_isolation= not args.no_isolation,
         runs         = args.runs,

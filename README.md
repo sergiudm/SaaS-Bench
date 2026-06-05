@@ -106,12 +106,15 @@ Useful flags:
 ```bash
 bash scripts/run.sh --workers 8                                 # bump concurrency
 bash scripts/run.sh --tasks-dir tasks/uni-m/Business                  # one domain
-bash scripts/run.sh --task-ids business_023 software_004             # cherry-pick
+bash scripts/run.sh --task-ids task_ids.txt                     # task ids from file
 bash scripts/run.sh --max-steps 200                             # tighter step budget
 bash scripts/run.sh --result-dir results/run_2026_05_05         # custom output dir
 bash scripts/run.sh --no-isolation                              # reuse already-running containers
 bash scripts/run.sh --log results/run.log                       # also tee to a file
 ```
+
+The `--task-ids` file may list one task id per line. Blank lines and `#`
+comments are ignored.
 
 Reusing the same `--result-dir` and `--model` automatically skips task runs
 that already have a valid `<task_id>_rN.json` result file. Pass

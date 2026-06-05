@@ -6,7 +6,7 @@
 #   ./scripts/run.sh                                       # run with default settings
 #   ./scripts/run.sh --workers 5                           # 5 concurrent workers
 #   ./scripts/run.sh --no-isolation                        # do not start Docker isolation containers
-#   ./scripts/run.sh --task-ids business_023 software_004
+#   ./scripts/run.sh --task-ids task_ids.txt
 #   ./scripts/run.sh --tasks-dir tasks/Business                 # run a single domain only
 
 set -euo pipefail
@@ -36,7 +36,7 @@ HOSTNAME_VAL="localhost"
 RESULT_DIR="${REPO_ROOT}/results"
 APPS_YAML="${REPO_ROOT}/saas_bench/apps.yaml"
 NO_ISOLATION=""
-TASK_IDS=""
+TASK_IDS_FILE="task_ids_21.txt"
 LOG_FILE=""
 RERUN_EXISTING=""
 
@@ -54,7 +54,7 @@ Options:
   --result-dir <path>     Output directory for results (default: rollout/results)
   --apps-yaml <path>      Path to apps.yaml (default: rollout/apps.yaml)
   --no-isolation          Disable Docker container isolation; connect directly to already-running apps via fixed_port
-  --task-ids <id> [...]   Run only the specified task ids (space-separated)
+  --task-ids <path>       Path to a file containing task ids to run
   --rerun-existing        Re-run tasks even if their result JSON files already exist
   --log <file>            Also write output to a log file
   -h, --help              Show this help
@@ -73,14 +73,7 @@ while [[ $# -gt 0 ]]; do
         --apps-yaml)   APPS_YAML="$2";       shift 2 ;;
         --no-isolation) NO_ISOLATION="--no-isolation"; shift ;;
         --rerun-existing) RERUN_EXISTING="--rerun-existing"; shift ;;
-        --task-ids)
-            shift
-            TASK_IDS=""
-            while [[ $# -gt 0 && "$1" != --* ]]; do
-                TASK_IDS="$TASK_IDS $1"
-                shift
-            done
-            ;;
+        --task-ids)    TASK_IDS_FILE="$2";   shift 2 ;;
         --log)         LOG_FILE="$2";        shift 2 ;;
         -h|--help)     usage ;;
         *) echo "Unknown option: $1"; usage ;;
@@ -111,6 +104,15 @@ if [[ ! -f "$APPS_YAML" ]]; then
     exit 1
 fi
 
+if [[ -n "$TASK_IDS_FILE" && ! -f "$TASK_IDS_FILE" ]]; then
+    echo "[ERROR] Task ids file does not exist: $TASK_IDS_FILE" >&2
+    exit 1
+fi
+
+if [[ -n "$TASK_IDS_FILE" ]]; then
+    TASK_IDS_FILE="$(cd "$(dirname "$TASK_IDS_FILE")" && pwd)/$(basename "$TASK_IDS_FILE")"
+fi
+
 # -- Print configuration summary ---------------------------------------------
 TIMESTAMP="$(date '+%Y-%m-%d %H:%M:%S')"
 TASK_COUNT="$(find "$TASKS_DIR" -name "meta.json" | wc -l | tr -d ' ')"
@@ -127,7 +129,7 @@ echo "  Max steps    : $MAX_STEPS"
 echo "  Hostname     : $HOSTNAME_VAL"
 echo "  Result dir   : $RESULT_DIR"
 echo "  Isolation    : ${NO_ISOLATION:-enabled (Docker per-slot)}"
-[[ -n "$TASK_IDS" ]] && echo "  Task ids     :$TASK_IDS"
+[[ -n "$TASK_IDS_FILE" ]] && echo "  Task ids file: $TASK_IDS_FILE"
 echo "============================================"
 echo ""
 
@@ -146,11 +148,7 @@ CMD=(
 [[ -n "$NO_ISOLATION" ]] && CMD+=("$NO_ISOLATION")
 [[ -n "$RERUN_EXISTING" ]] && CMD+=("$RERUN_EXISTING")
 
-if [[ -n "$TASK_IDS" ]]; then
-    CMD+=(--task-ids)
-    # shellcheck disable=SC2206
-    CMD+=($TASK_IDS)
-fi
+[[ -n "$TASK_IDS_FILE" ]] && CMD+=(--task-ids "$TASK_IDS_FILE")
 
 # -- Execute ----------------------------------------------------------------
 cd "$REPO_ROOT"

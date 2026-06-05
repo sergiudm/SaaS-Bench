@@ -49,7 +49,7 @@ bash scripts/run.sh
 
 ```bash
 bash scripts/run.sh --tasks-dir tasks/uni-m/Business
-bash scripts/run.sh --task-ids business_023 software_004
+bash scripts/run.sh --task-ids task_ids.txt
 ```
 
 - Clean up stale containers from a crashed or interrupted run:
