@@ -1,0 +1,4 @@
+interface:
+  display_name: "Audit Trajectories"
+  short_description: "Audit SaaS-Bench trajectory quality"
+  default_prompt: "Use $audit-trajectories to audit results-subset/gemini-3.5-flash and write a detailed trajectory quality report."
