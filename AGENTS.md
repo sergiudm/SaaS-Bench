@@ -82,3 +82,4 @@ There is no dedicated test suite in the current repository snapshot, so validate
 - Verifiers inspect live Docker application state; do not make harness changes that bypass task `verify.py` behavior.
 - Be careful with generated outputs under `results/` and runtime container state. Do not delete run artifacts unless the user asks.
 - The repository may have local user edits. Check `git status --short` before modifying files and do not revert unrelated changes.
+- If you write an ad hoc script to probe behavior, inspect outputs, or calculate metrics, define sensible default arguments such as input/output paths inside the script so the user can run it without passing required terminal arguments.

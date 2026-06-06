@@ -7,7 +7,7 @@ name = "saas-bench"
 version = "0.1.0"
 description = "SaaS-Bench: a benchmark for evaluating LLM agents on real SaaS applications."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = {text = "Apache-2.0"}
 authors = [
     {name = "SaaS-Bench Authors"},

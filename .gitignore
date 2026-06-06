@@ -7,6 +7,7 @@ build/
 dist/
 .venv/
 venv/
+uv.lock
 
 # Local env
 .env
@@ -14,6 +15,8 @@ venv/
 # Local results / scratch
 results/
 results_*/
+results-*/
+
 *.log
 
 # Docker image archives (downloaded separately, see docker/README.md)
