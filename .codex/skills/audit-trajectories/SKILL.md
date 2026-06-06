@@ -56,7 +56,7 @@ Include these sections unless the user asks for a narrower report:
 - Scope and methodology: experiment path, task/run counts, files inspected, sampling policy if not all tasks were reviewed.
 - Dataset inventory: missing primary trajectories, missing verifier files, zero-step runs, verifier errors, and incomplete artifacts.
 - Quantitative signals: pass rate, score distribution, step statistics, action distribution, done/self-report calibration, loop/error indicators.
-- Failure taxonomy: grouped root causes with task examples and evidence.
+- Failure taxonomy: three required sections named `Infra-Level Errors`, `LLM API Errors`, and `Agent Capabilities Issues`, each with root causes, task examples, evidence, impact, and recommended fixes.
 - Per-task audits: concise but detailed notes for every reviewed task, including requirement coverage and key trajectory evidence.
 - Verifier and harness concerns: suspected false positives/negatives, missing artifacts, crashed runs, or malformed outputs.
 - Recommendations: concrete agent, prompt, harness, verifier, or benchmark-process changes, prioritized by expected impact.
@@ -71,6 +71,7 @@ Include these sections unless the user asks for a narrower report:
 - Do not mark a task as low quality solely because it failed verification; explain the behavioral reason.
 - Check whether partial credit reflects meaningful progress or accidental state.
 - When a trajectory is absent, report artifact quality separately from agent behavior.
+- Classify failures by root cause. Use infra-level errors for harness, artifact, container, app, browser, verifier, or input failures; LLM API errors for provider, quota, model, judge, or token/response service failures; and agent capabilities issues for observable planning, navigation, tool-use, data-entry, verification, recovery, or self-calibration weaknesses.
 
 ## Helper Script
 

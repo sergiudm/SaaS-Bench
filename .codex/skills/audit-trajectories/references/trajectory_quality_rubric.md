@@ -49,17 +49,73 @@ If the run has more than 25 task runs, audit:
 
 State the sampling rule in the report. Do not imply unreviewed tasks were manually inspected.
 
-## Common SaaS-Bench Failure Modes
+## Failure Taxonomy
 
-- Dynamic DOM index loops: repeated click/input attempts at huge or changing indices without changing strategy.
-- Navigate-discipline problems: many page opens or app switches that do not correspond to required sites.
-- Read-only partial credit: agent inspects existing records that already satisfy some checks but never performs required mutations.
-- Premature completion: `done` action or final output claims success before verifier-critical state exists.
-- Data drift: correct workflow with wrong date, amount, title, assignee, body text, file, status, or account.
-- Cross-app dependency break: completes an earlier app but never carries required data into later apps.
-- Weak confirmation: assumes a save/submit worked after clicking but does not inspect status, report, or list state.
-- Tool/file distraction: spends many steps editing `todo.md` or reading files without app progress.
-- Artifact failure: no primary trajectory, missing verify file, malformed JSON, or run status inconsistent with files.
+The final report must organize root causes into exactly these three top-level sections. A task can appear in more than one section when multiple causes contributed, but identify one primary cause when possible.
+
+### 1. Infra-Level Errors
+
+Use this section for failures in the benchmark harness, runtime environment, application services, browser/session layer, input assets, artifacts, or verifier infrastructure. These failures make the trajectory missing, incomplete, unreliable, or impossible to fairly judge independent of the agent's decisions.
+
+Common subcategories:
+
+- Missing artifacts: no primary trajectory JSON, no verifier JSON, missing `summary.json`, absent screenshots/files, or missing multimodal inputs.
+- Malformed artifacts: invalid JSON, truncated trajectories, inconsistent task IDs, missing `trajectory`, missing `checks`, or run status inconsistent with files.
+- Zero-step or crashed runs: summary reports zero steps, process exits before browser work, worker crash, interrupted run, or empty output caused by harness failure.
+- Container/app availability: Docker service not started, app health failure, wrong port, hostname unreachable, database unavailable, app setup/reset failure, or stale container state.
+- Browser/session failures: browser launch crash, tab/session loss, persistent timeout unrelated to app complexity, automation protocol failure, or unavailable browser dependencies.
+- Credential/config problems: wrong seeded credentials, missing environment variables, login disabled by setup drift, or task points to an unavailable app instance.
+- Input/data setup problems: missing task fixture, missing uploaded file, wrong seeded records, contaminated state from previous tasks, or fixture mismatch with description/verifier.
+- Verifier infrastructure errors: verifier cannot connect to app/database, SQL exception, verifier dependency missing, verifier crashes before checking state, or verifier returns ERROR/SKIP for infrastructure reasons.
+- Report generation/accounting errors: summary statistics inconsistent with artifacts, missing per-task usage stats due to run collection failure, or benchmark report omits existing runs.
+
+Evidence to include:
+
+- File paths, run IDs, exception text, return codes, missing filenames, service URLs/ports, verifier status/error fields, and whether any meaningful trajectory steps exist.
+
+### 2. LLM API Errors
+
+Use this section for failures in model-provider calls used by the agent or by verifier LLM/vision judges. Keep these separate from generic infra because the fix is usually quota/model/provider handling, not browser-agent behavior.
+
+Common subcategories:
+
+- Quota or billing limits: HTTP 429, spending cap exceeded, token quota exhausted, or provider-side rate limit.
+- Authentication/authorization: missing API key, invalid key, expired credential, 401, 403, or project not authorized for the requested model.
+- Model availability: requested model not found, model deprecated, model endpoint unavailable, unsupported region, 404 model/judge errors, or unavailable vision/judge model.
+- Provider outages/server errors: 5xx errors, service unavailable, transient provider failure, or repeated provider-side timeouts.
+- Context/token failures: prompt exceeds context window, max output/token limit prevents valid response, response truncated before tool/action JSON, or provider rejects image/file payload size.
+- Response format failures: malformed provider response, invalid tool-call payload caused by provider output, empty completion, or refusal/safety block unrelated to the benchmark task.
+- Usage/pricing telemetry gaps: missing usage records, unpriced calls, or partial cost accounting when this affects evaluating run reliability.
+- LLM judge failures: verifier `llm_judge` or `llm_judge_vision` returns API error, rate limit, unavailable model, or transport error.
+
+Evidence to include:
+
+- Provider error text, HTTP status, model name, task step or verifier check where the API failed, whether the failure stopped the agent or only affected verification, and whether retry/backoff was attempted.
+
+### 3. Agent Capabilities Issues
+
+Use this section for observable shortcomings in the agent's reasoning, UI operation, tool use, state mutation, recovery, or calibration. These failures are attributable to the trajectory even when the infrastructure and LLM API are available.
+
+Common subcategories:
+
+- Task comprehension errors: wrong goal, wrong app, wrong entity, missed constraints, skipped required intermediate validation, or hallucinated requirement.
+- Planning/decomposition failures: no usable checklist, wrong dependency order, losing track of completed subtasks, or failure to break multi-app workflows into durable milestones.
+- Navigation/app-context failures: cannot find target pages, overuses page switching, loses the active app, opens irrelevant routes, or violates expected site navigation discipline.
+- DOM/UI targeting failures: repeated clicks on unstable indices, wrong element selection, failure to use search/filter/direct URLs, or inability to operate dynamic forms.
+- Form/data-entry failures: wrong field, missing required field, bad dropdown choice, wrong date/amount/status/text, failure to save/submit, or overwritten existing values.
+- State-mutation failures: reads existing data but never creates/edits/approves/uploads/pays/sends the required final state.
+- Cross-app coordination failures: completes one system but fails to carry required data into another app, misses dependency handoff, or creates inconsistent records across apps.
+- Verification failures: assumes success after a click, does not inspect reports/lists/statuses, ignores failed save messages, or fails to compare final state against task requirements.
+- Recovery failures: loops on the same action, ignores errors, repeats ineffective strategies, fails to escalate to alternate UI routes, or consumes the budget without changing tactics.
+- Multimodal/perception failures: misidentifies image/PDF content, misses visual details needed for the task, or uses unsupported visual assumptions.
+- Code/file/tool-use failures: edits `todo.md` instead of app state, misuses file tools, fails to use available browser/search/extract tools, or makes non-task file changes.
+- Memory/context failures: forgets task-specific names/amounts/dates, contradicts previous observations, or confuses records between tasks/apps.
+- Efficiency/time-budget failures: excessive waits, low-value scrolling/searching, near-max-step runs dominated by repeated actions, or no prioritization of verifier-critical requirements.
+- Self-calibration failures: `done(success=true)` or final output claims success despite failed/missing requirements, hides uncertainty, or gives no useful blocker summary.
+
+Evidence to include:
+
+- Step ranges, observed action/result patterns, failed verifier checks, exact data mismatches, repeated spans, final-output claims, and the missed task requirement.
 
 ## Report Tone
 
