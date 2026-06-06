@@ -116,18 +116,32 @@ fi
 # -- Print configuration summary ---------------------------------------------
 TIMESTAMP="$(date '+%Y-%m-%d %H:%M:%S')"
 TASK_COUNT="$(find "$TASKS_DIR" -name "meta.json" | wc -l | tr -d ' ')"
+MODEL_SLUG="${MODEL//\//_}"
+MODEL_SLUG="${MODEL_SLUG//:/_}"
+MODEL_RESULT_DIR="${RESULT_DIR}/${MODEL_SLUG}"
+
+mask_env_key() {
+    local value="${1:-}"
+    if [[ -z "$value" ]]; then
+        echo "unset"
+    else
+        echo "set (masked, len=${#value})"
+    fi
+}
 
 echo "============================================"
 echo "  SaaS-Bench concurrent evaluation"
 echo "============================================"
 echo "  Start time   : $TIMESTAMP"
 echo "  Task dir     : $TASKS_DIR"
-echo "  Total tasks  : $TASK_COUNT"
+echo "  Found tasks  : $TASK_COUNT"
 echo "  Model        : $MODEL"
+echo "  LLM base URL : ${LLM_BASE_URL:-unset}"
+echo "  API keys     : LLM_API_KEY=$(mask_env_key "${LLM_API_KEY:-}") | MINDRA_API_KEY=$(mask_env_key "${MINDRA_API_KEY:-}")"
 echo "  Workers      : $WORKERS"
 echo "  Max steps    : $MAX_STEPS"
 echo "  Hostname     : $HOSTNAME_VAL"
-echo "  Result dir   : $RESULT_DIR"
+echo "  Result dir   : $MODEL_RESULT_DIR"
 echo "  Isolation    : ${NO_ISOLATION:-enabled (Docker per-slot)}"
 [[ -n "$TASK_IDS_FILE" ]] && echo "  Task ids file: $TASK_IDS_FILE"
 echo "============================================"
@@ -166,10 +180,10 @@ EXIT_CODE=${PIPESTATUS[0]:-$?}
 echo ""
 echo "============================================"
 echo "  Done, exit code: $EXIT_CODE"
-echo "  Result dir: $RESULT_DIR"
-[[ -f "$RESULT_DIR/summary.json" ]] && echo "  Summary:" && "$PYTHON" -c "
+echo "  Result dir: $MODEL_RESULT_DIR"
+[[ -f "$MODEL_RESULT_DIR/summary.json" ]] && echo "  Summary:" && "$PYTHON" -c "
 import json
-s = json.load(open('$RESULT_DIR/summary.json'))
+s = json.load(open('$MODEL_RESULT_DIR/summary.json'))
 print(f\"    Total : {s.get('completed',0)}/{s.get('total',0)} completed\")
 for cat, ds in sorted(s.get('domains', {}).items()):
     avg = ds.get('avg_verify_score', 0)

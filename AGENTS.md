@@ -11,6 +11,8 @@ The reference agent is implemented in `saas_bench/agent.py` and uses `browser-us
 - Use `uv` for the Python environment and dependency management.
 - Python must be `>=3.10`.
 - Prefer running Python commands through `uv run`.
+- On this machine, ripgrep (`rg`) is not installed. Use alternatives such as `grep`, `find`, `sed`, or Python-based tooling when searching files.
+- Bubblewrap (`bwrap`) is also unavailable. If sandboxed shell commands fail with a bubblewrap/bwrap error, retry with the appropriate approved or escalated command path rather than treating it as a project failure.
 - Install this package in editable mode with:
 
 ```bash

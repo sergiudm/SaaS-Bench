@@ -14,7 +14,7 @@ import subprocess
 import tempfile
 import time
 import traceback
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -38,6 +38,91 @@ _TMP_BASE = os.environ.get(
 def _load_apps_config(apps_yaml: str) -> dict:
     with open(apps_yaml) as f:
         return yaml.safe_load(f)["apps"]
+
+
+def _clip(value: str | None, limit: int = 96) -> str:
+    if not value:
+        return "unset"
+    value = value.strip()
+    if len(value) <= limit:
+        return value
+    return value[: limit - 3] + "..."
+
+
+def _mask_secret(value: str | None) -> str:
+    if not value or not value.strip():
+        return "unset"
+    return f"set (masked, len={len(value.strip())})"
+
+
+def _category_summary(tasks: list[dict]) -> str:
+    counts = Counter(str(task.get("category_id") or "UNKNOWN") for task in tasks)
+    if not counts:
+        return "none"
+    return ", ".join(f"{category}={count}" for category, count in sorted(counts.items()))
+
+
+def _print_experiment_summary(
+    *,
+    started_at: datetime,
+    tasks_dir: str,
+    all_task_count: int,
+    tasks: list[dict],
+    task_ids_file: str | None,
+    missing_task_ids: list[str],
+    apps_yaml: str,
+    apps_config: dict,
+    model: str,
+    workers: int,
+    result_dir: str,
+    max_steps: int,
+    hostname: str,
+    use_isolation: bool,
+    runs: int,
+    run_start: int,
+    requested_jobs: int,
+    pending_jobs: int,
+    skipped_jobs: int,
+    rerun_existing: bool,
+) -> None:
+    run_end = run_start + runs - 1
+    run_label = f"r{run_start}" if run_start == run_end else f"r{run_start}..r{run_end}"
+    task_filter = task_ids_file or "none"
+    missing_label = "none"
+    if missing_task_ids:
+        preview = ", ".join(missing_task_ids[:20])
+        missing_label = f"{len(missing_task_ids)} ({preview}{' ...' if len(missing_task_ids) > 20 else ''})"
+
+    print("\n=== Experiment ===", flush=True)
+    print(f"  Date        : {started_at.strftime('%Y-%m-%d %H:%M:%S %Z%z')}", flush=True)
+    print(f"  Tasks       : {len(tasks)} selected / {all_task_count} discovered", flush=True)
+    print(f"  Task dir    : {tasks_dir}", flush=True)
+    print(f"  Task ids    : {task_filter}", flush=True)
+    if missing_task_ids:
+        print(f"  Missing ids : {missing_label}", flush=True)
+    print(f"  Categories  : {_category_summary(tasks)}", flush=True)
+    print(f"  Runs        : {runs} ({run_label})", flush=True)
+    print(
+        f"  Jobs        : {requested_jobs} requested | {pending_jobs} pending | "
+        f"{skipped_jobs} skipped_existing",
+        flush=True,
+    )
+    print(f"  Workers     : {workers}", flush=True)
+    print(f"  Max steps   : {max_steps}", flush=True)
+    print(f"  Model       : {model}", flush=True)
+    print(f"  LLM base URL: {_clip(os.environ.get('LLM_BASE_URL'))}", flush=True)
+    print(
+        "  API keys    : "
+        f"LLM_API_KEY={_mask_secret(os.environ.get('LLM_API_KEY'))} | "
+        f"MINDRA_API_KEY={_mask_secret(os.environ.get('MINDRA_API_KEY'))}",
+        flush=True,
+    )
+    print(f"  Apps config : {apps_yaml} ({len(apps_config)} apps)", flush=True)
+    print(f"  Hostname    : {hostname}", flush=True)
+    print(f"  Isolation   : {use_isolation}", flush=True)
+    print(f"  Rerun       : {rerun_existing}", flush=True)
+    print(f"  Result dir  : {result_dir}", flush=True)
+    print("==================", flush=True)
 
 
 def _global_cleanup() -> None:
@@ -274,8 +359,7 @@ def main(
     write_report: bool = True,
     rerun_existing: bool = False,
 ) -> None:
-    _global_cleanup()
-    started_at = datetime.now()
+    started_at = datetime.now().astimezone()
     t0 = time.perf_counter()
 
     # Nest results under a model-named subdirectory so different model runs
@@ -284,6 +368,8 @@ def main(
     result_dir = str(Path(result_dir) / model_slug)
 
     tasks = load_tasks(tasks_dir)
+    all_task_count = len(tasks)
+    missing_ids: list[str] = []
     if task_ids_file:
         task_ids = _load_task_ids_file(task_ids_file)
         task_id_set = set(task_ids)
@@ -317,12 +403,29 @@ def main(
 
     requested_jobs = len(tasks) * runs
     total_jobs = sum(len(run_indices_for_task) for _, run_indices_for_task in pending_jobs)
-    print(
-        f"Loaded {len(tasks)} tasks × runs={runs} (r{run_start}..r{run_start+runs-1}) = {requested_jobs} requested jobs | "
-        f"pending={total_jobs} skipped_existing={skipped_jobs} | "
-        f"workers={workers} | model={model} | isolation={use_isolation}",
-        flush=True,
+    _print_experiment_summary(
+        started_at=started_at,
+        tasks_dir=tasks_dir,
+        all_task_count=all_task_count,
+        tasks=tasks,
+        task_ids_file=task_ids_file,
+        missing_task_ids=missing_ids,
+        apps_yaml=apps_yaml,
+        apps_config=apps_config,
+        model=model,
+        workers=workers,
+        result_dir=result_dir,
+        max_steps=max_steps,
+        hostname=hostname,
+        use_isolation=use_isolation,
+        runs=runs,
+        run_start=run_start,
+        requested_jobs=requested_jobs,
+        pending_jobs=total_jobs,
+        skipped_jobs=skipped_jobs,
+        rerun_existing=rerun_existing,
     )
+    _global_cleanup()
 
     # Each task's r0→r1→...→rN runs serially on the same slot.
     # Tasks themselves run in parallel across workers (one slot per task).
@@ -358,7 +461,7 @@ def main(
     else:
         print("No pending task results; all selected task JSON files already exist.", flush=True)
 
-    ended_at = datetime.now()
+    ended_at = datetime.now().astimezone()
     duration_s = round(time.perf_counter() - t0, 1)
 
     # Group statistics by domain (per task×run)
