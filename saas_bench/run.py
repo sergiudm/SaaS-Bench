@@ -62,6 +62,14 @@ def _category_summary(tasks: list[dict]) -> str:
     return ", ".join(f"{category}={count}" for category, count in sorted(counts.items()))
 
 
+def _format_task_index(task_index: int | None, task_count: int | None = None) -> str:
+    if task_index is None:
+        return "task_index=?"
+    if task_count is None:
+        return f"task_index={task_index}"
+    return f"task_index={task_index} ({task_index + 1}/{task_count})"
+
+
 def _print_experiment_summary(
     *,
     started_at: datetime,
@@ -114,6 +122,8 @@ def _print_experiment_summary(
     print(
         "  API keys    : "
         f"LLM_API_KEY={_mask_secret(os.environ.get('LLM_API_KEY'))} | "
+        f"LLM_API_KEYS={_mask_secret(os.environ.get('LLM_API_KEYS'))} | "
+        f"GEMINI_API_KEYS={_mask_secret(os.environ.get('GEMINI_API_KEYS'))} | "
         f"MINDRA_API_KEY={_mask_secret(os.environ.get('MINDRA_API_KEY'))}",
         flush=True,
     )
@@ -246,6 +256,8 @@ def _run_one(
     use_isolation: bool,
     run_idx: int = 0,
     tasks_dir: str = "",
+    task_index: int | None = None,
+    task_count: int | None = None,
 ) -> dict:
     """Full execution of a single task (runs in a thread pool, owns its own asyncio event loop)."""
     import asyncio
@@ -285,10 +297,27 @@ def _run_one(
                 task, model, prompt, result_dir,
                 max_steps=max_steps, slot_id=slot_id, todo_md=todo_md,
                 run_idx=run_idx, input_files=input_files,
+                task_index=task_index, task_count=task_count,
             )
         )
 
-        if use_isolation and task.get("verify_py_path"):
+        if agent_result.get("status") == "llm_api_abort":
+            verify_result = {
+                "task_id": task["task_id"],
+                "status": "LLM_API_ABORT",
+                "score": 0.0,
+                "checks": [],
+                "error": "verification skipped because the agent run aborted on repeated LLM API failures",
+            }
+            verify_path = Path(result_dir) / f"{task['task_id']}{run_suffix}_verify.json"
+            verify_path.parent.mkdir(parents=True, exist_ok=True)
+            verify_path.write_text(json.dumps(verify_result, indent=2))
+            print(
+                f"  [slot {slot_id}][{task['task_id']}{run_suffix}] "
+                f"LLM_API_ABORT {_format_task_index(task_index, task_count)}",
+                flush=True,
+            )
+        elif use_isolation and task.get("verify_py_path"):
             verify_result = run_verify(task, slot_id, port_map, hostname, result_dir,
                                        run_suffix=run_suffix)
         else:
@@ -332,6 +361,8 @@ def _run_task_runs(
     use_isolation: bool,
     run_indices: list[int],
     tasks_dir: str = "",
+    task_index: int | None = None,
+    task_count: int | None = None,
 ) -> list[tuple[int, dict]]:
     """Selected runs of a single task execute serially on the same slot."""
     results = []
@@ -339,6 +370,7 @@ def _run_task_runs(
         result = _run_one(
             task, slot_id, apps_config, model, result_dir,
             max_steps, hostname, use_isolation, run_idx, tasks_dir,
+            task_index, task_count,
         )
         results.append((run_idx, result))
     return results
@@ -389,9 +421,9 @@ def main(
 
     run_indices = list(range(run_start, run_start + runs))
     result_path = Path(result_dir)
-    pending_jobs: list[tuple[dict, list[int]]] = []
+    pending_jobs: list[tuple[dict, int, list[int]]] = []
     skipped_jobs = 0
-    for task in tasks:
+    for task_index, task in enumerate(tasks):
         task_run_indices = [
             run_idx
             for run_idx in run_indices
@@ -399,10 +431,10 @@ def main(
         ]
         skipped_jobs += len(run_indices) - len(task_run_indices)
         if task_run_indices:
-            pending_jobs.append((task, task_run_indices))
+            pending_jobs.append((task, task_index, task_run_indices))
 
     requested_jobs = len(tasks) * runs
-    total_jobs = sum(len(run_indices_for_task) for _, run_indices_for_task in pending_jobs)
+    total_jobs = sum(len(run_indices_for_task) for _, _, run_indices_for_task in pending_jobs)
     _print_experiment_summary(
         started_at=started_at,
         tasks_dir=tasks_dir,
@@ -441,11 +473,12 @@ def main(
                     apps_config, model,
                     result_dir, max_steps, hostname, use_isolation,
                     task_run_indices, tasks_dir,
-                ): (task, task_run_indices)
-                for i, (task, task_run_indices) in enumerate(pending_jobs)
+                    task_index, len(tasks),
+                ): (task, task_index, task_run_indices)
+                for i, (task, task_index, task_run_indices) in enumerate(pending_jobs)
             }
             for fut in as_completed(futures):
-                task, task_run_indices = futures[fut]
+                task, task_index, task_run_indices = futures[fut]
                 try:
                     for run_idx, result in fut.result():
                         task_results.append((task, run_idx, result))
@@ -466,7 +499,7 @@ def main(
 
     # Group statistics by domain (per task×run)
     domain_stats: dict[str, dict] = defaultdict(
-        lambda: {"total": 0, "completed": 0, "error": 0, "exception": 0,
+        lambda: {"total": 0, "completed": 0, "llm_api_abort": 0, "error": 0, "exception": 0,
                  "verify_pass": 0, "verify_scores": []}
     )
     for task, run_idx, result in task_results:
@@ -478,6 +511,8 @@ def main(
         elif isinstance(result, dict):
             if result.get("status") == "completed":
                 ds["completed"] += 1
+            elif result.get("status") == "llm_api_abort":
+                ds["llm_api_abort"] += 1
             else:
                 ds["error"] += 1
             vs = result.get("verify_status", "SKIP")
@@ -496,7 +531,7 @@ def main(
         print(
             f"  {cat:6s}: {ds['completed']}/{ds['total']} completed | "
             f"verify_pass={ds['verify_pass']} avg_score={avg_score:.3f} | "
-            f"error={ds['error']} exception={ds['exception']}",
+            f"llm_api_abort={ds['llm_api_abort']} error={ds['error']} exception={ds['exception']}",
             flush=True,
         )
     print(f"  Total : {total_completed}/{total_jobs_done} (tasks={len(tasks)}, runs={runs})", flush=True)

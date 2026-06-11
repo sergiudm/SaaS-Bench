@@ -138,6 +138,17 @@ total LLM usage and spending across the selected task runs. Set
 `LLM_INPUT_PRICE_PER_1M_TOKENS` and `LLM_OUTPUT_PRICE_PER_1M_TOKENS` in
 `.env` when your endpoint uses custom pricing.
 
+To inspect trajectories visually, generate a static HTML viewer from a result
+directory:
+
+```bash
+uv run python scripts/build_trajectory_viewer.py results/gemini-3.5-flash
+```
+
+This writes `trajectory_viewer.html` beside the result JSON files. It is a
+read-only analysis UI with task selection, step playback, failure hot spots,
+URL changes, verifier checks, and raw step JSON inspection.
+
 When in doubt, you can purge stale containers from a previous (crashed) run:
 
 ```bash

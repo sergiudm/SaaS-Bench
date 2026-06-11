@@ -15,12 +15,119 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# -- Load .env (if present) so LLM_API_KEY/LLM_BASE_URL/LLM_MODEL get exported
+# -- Load .env (if present) so LLM_API_KEY/LLM_BASE_URL/LLM_MODEL get exported.
+# This parser intentionally does not source .env as shell code.  It supports
+# KEY=value plus multi-line list syntax for LLM_API_KEYS/GEMINI_API_KEYS:
+#   GEMINI_API_KEYS=[
+#     "key1",
+#     "key2"
+#   ]
+_trim_env_text() {
+    local value="$1"
+    value="${value//$'\r'/}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
+
+_strip_env_scalar() {
+    local value
+    value="$(_trim_env_text "$1")"
+    if [[ ${#value} -ge 2 ]]; then
+        if [[ "${value:0:1}" == '"' && "${value: -1}" == '"' ]]; then
+            value="${value:1:${#value}-2}"
+        elif [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]]; then
+            value="${value:1:${#value}-2}"
+        fi
+    fi
+    printf '%s' "$value"
+}
+
+_normalize_env_list() {
+    local raw part
+    raw="${1//$'\r'/}"
+    raw="${raw//$'\n'/,}"
+    raw="${raw//[/,}"
+    raw="${raw//]/,}"
+    raw="${raw//(/,}"
+    raw="${raw//)/,}"
+    raw="${raw//\"/}"
+    raw="${raw//\'/}"
+    raw="${raw//;/,}"
+
+    local parts=()
+    IFS=',' read -r -a parts <<< "$raw"
+    local cleaned=()
+    for part in "${parts[@]}"; do
+        part="$(_trim_env_text "$part")"
+        [[ -n "$part" ]] && cleaned+=("$part")
+    done
+    local IFS=,
+    printf '%s' "${cleaned[*]}"
+}
+
+_export_env_assignment() {
+    local key="$1"
+    local value="$2"
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 0
+
+    if [[ "$key" == "LLM_API_KEYS" || "$key" == "GEMINI_API_KEYS" ]]; then
+        value="$(_normalize_env_list "$value")"
+    else
+        value="$(_strip_env_scalar "$value")"
+    fi
+
+    printf -v "$key" '%s' "$value"
+    export "$key"
+}
+
+_load_env_file() {
+    local env_file="$1"
+    local line trimmed key value collecting_key collecting_value
+    collecting_key=""
+    collecting_value=""
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line//$'\r'/}"
+
+        if [[ -n "$collecting_key" ]]; then
+            collecting_value+=$'\n'"$line"
+            if [[ "$line" == *"]"* || "$line" == *")"* ]]; then
+                _export_env_assignment "$collecting_key" "$collecting_value"
+                collecting_key=""
+                collecting_value=""
+            fi
+            continue
+        fi
+
+        trimmed="$(_trim_env_text "$line")"
+        [[ -z "$trimmed" || "$trimmed" == \#* ]] && continue
+        [[ "$trimmed" == export\ * ]] && trimmed="${trimmed#export }"
+        [[ "$trimmed" == *"="* ]] || continue
+
+        key="$(_trim_env_text "${trimmed%%=*}")"
+        value="${trimmed#*=}"
+
+        if [[ "$key" == "LLM_API_KEYS" || "$key" == "GEMINI_API_KEYS" ]]; then
+            if [[ "$value" == *"["* || "$value" == *"("* ]]; then
+                if [[ "$value" != *"]"* && "$value" != *")"* ]]; then
+                    collecting_key="$key"
+                    collecting_value="$value"
+                    continue
+                fi
+            fi
+        fi
+
+        _export_env_assignment "$key" "$value"
+    done < "$env_file"
+
+    if [[ -n "$collecting_key" ]]; then
+        _export_env_assignment "$collecting_key" "$collecting_value"
+    fi
+}
+
 if [[ -f "$REPO_ROOT/.env" ]]; then
-    set -o allexport
-    # shellcheck disable=SC1091
-    source "$REPO_ROOT/.env"
-    set +o allexport
+    _load_env_file "$REPO_ROOT/.env"
 fi
 
 # -- Python interpreter ------------------------------------------------------
@@ -29,15 +136,15 @@ export BROWSER_USE_LOGGING_LEVEL=warning
 
 # -- Default arguments -------------------------------------------------------
 TASKS_DIR="${REPO_ROOT}/tasks"
-MODEL="${LLM_MODEL:-claude-opus-4-6}"
-WORKERS=4
+MODEL="${LLM_MODEL}"
+WORKERS=8
 MAX_STEPS=400
 HOSTNAME_VAL="localhost"
-RESULT_DIR="${REPO_ROOT}/results"
+RESULT_DIR="${REPO_ROOT}/results-subset"
 APPS_YAML="${REPO_ROOT}/saas_bench/apps.yaml"
 NO_ISOLATION=""
-TASK_IDS_FILE="task_ids_21.txt"
-LOG_FILE=""
+TASK_IDS_FILE=""
+LOG_FILE="gfull2.log"
 RERUN_EXISTING=""
 
 # -- Argument parsing --------------------------------------------------------
@@ -89,8 +196,13 @@ if ! "$PYTHON" -c "import saas_bench" 2>/dev/null; then
     fi
 fi
 
-if [[ -z "${LLM_API_KEY:-}" || -z "${LLM_BASE_URL:-}" ]]; then
-    echo "[ERROR] LLM_API_KEY / LLM_BASE_URL not set; please cp .env.example .env, fill it in, and retry" >&2
+if [[ -z "${LLM_BASE_URL:-}" ]]; then
+    echo "[ERROR] LLM_BASE_URL not set; please cp .env.example .env, fill it in, and retry" >&2
+    exit 1
+fi
+
+if [[ -z "${LLM_API_KEY:-}" && -z "${LLM_API_KEYS:-}" && -z "${GEMINI_API_KEYS:-}" ]]; then
+    echo "[ERROR] Set LLM_API_KEY, or for Gemini set LLM_API_KEYS/GEMINI_API_KEYS in .env" >&2
     exit 1
 fi
 

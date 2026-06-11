@@ -253,6 +253,21 @@ def _task_passk(task_runs: list[dict]) -> dict:
     agent_completed_any = any(
         r["agent"].get("status") == "completed" for r in task_runs
     )
+    llm_api_abort_runs = [
+        r for r in task_runs
+        if r["agent"].get("status") == "llm_api_abort"
+        or r["verify"].get("status") == "LLM_API_ABORT"
+    ]
+    task_indices: list[int] = []
+    for r in task_runs:
+        agent = r.get("agent")
+        if not isinstance(agent, dict) or "task_index" not in agent:
+            continue
+        try:
+            task_indices.append(int(agent["task_index"]))
+        except (TypeError, ValueError):
+            continue
+    task_indices = sorted(set(task_indices))
 
     return {
         "runs":               n,
@@ -266,6 +281,9 @@ def _task_passk(task_runs: list[dict]) -> dict:
         "min_steps":          min(steps) if steps else 0,
         "checkpoint_score":   checkpoint_score,
         "agent_completed_any": agent_completed_any,
+        "llm_api_abort_runs": len(llm_api_abort_runs),
+        "llm_api_abort_any": bool(llm_api_abort_runs),
+        "task_indices": task_indices,
     }
 
 
@@ -302,6 +320,8 @@ def _overall(task_aggs: dict[str, dict], runs: int) -> dict:
             first_pass_dist[f"r{idx}"] = first_pass_dist.get(f"r{idx}", 0) + 1
 
     agent_ok = sum(1 for agg in task_aggs.values() if agg["agent_completed_any"])
+    llm_api_abort_tasks = sum(1 for agg in task_aggs.values() if agg.get("llm_api_abort_any"))
+    llm_api_abort_runs = sum(int(agg.get("llm_api_abort_runs") or 0) for agg in task_aggs.values())
 
     # score buckets (based on best_score)
     perfect = sum(1 for s in best_scores if s >= 1.0)
@@ -312,6 +332,8 @@ def _overall(task_aggs: dict[str, dict], runs: int) -> dict:
         "total":   total,
         "runs":    runs,
         "agent_completed_any": agent_ok,
+        "llm_api_abort_tasks": llm_api_abort_tasks,
+        "llm_api_abort_runs": llm_api_abort_runs,
         "pass_at_k": {
             k: {
                 "count":  pass_at_k_counts[k],
@@ -569,6 +591,9 @@ def _per_task_rows(task_aggs: dict[str, dict], records: list[dict], runs: int) -
             "steps_per_run":        agg["steps"],
             "avg_steps":            round(agg["avg_steps"], 1),
             "agent_output_preview": preview,
+            "task_indices":          agg.get("task_indices", []),
+            "llm_api_abort_any":     agg.get("llm_api_abort_any", False),
+            "llm_api_abort_runs":    agg.get("llm_api_abort_runs", 0),
         }
         # flatten pass_at_k for readability when runs=1
         if runs == 1:
@@ -593,6 +618,7 @@ def _md_overall(s: dict) -> str:
         f"| Tasks | {o['total']} |",
         f"| Runs per task | {runs} |",
         f"| Agent completed (any run) | {o['agent_completed_any']} / {o['total']} |",
+        f"| LLM API aborts | {o.get('llm_api_abort_tasks', 0)} tasks / {o.get('llm_api_abort_runs', 0)} runs |",
     ]
     for k in range(1, runs + 1):
         pk = o["pass_at_k"][k]
@@ -758,10 +784,10 @@ def _md_per_task(s: dict) -> str:
     runs = s["overall"]["runs"]
     pk_headers = " | ".join(f"p@{k}" for k in range(1, runs + 1))
     header = (
-        f"| Task ID | Domain | Sites | {pk_headers} | Best | CkPt | Avg Steps | Output Preview |\n"
+        f"| Task ID | Domain | Sites | {pk_headers} | Best | CkPt | Avg Steps | LLM API Abort | Output Preview |\n"
         f"|---------|--------|-------|"
         + "".join("----:|" for _ in range(runs))
-        + "-----:|-----:|----------:|----------------|"
+        + "-----:|-----:|----------:|--------------|----------------|"
     )
     rows = []
     for t in s["tasks"]:
@@ -771,10 +797,15 @@ def _md_per_task(s: dict) -> str:
             "✓" if t["pass_at_k"].get(str(k)) else "✗"
             for k in range(1, runs + 1)
         )
+        abort_label = "—"
+        if t.get("llm_api_abort_any"):
+            indices = t.get("task_indices") or []
+            index_label = ",".join(str(i) for i in indices) if indices else "?"
+            abort_label = f"{t.get('llm_api_abort_runs', 0)} run(s), index {index_label}"
         rows.append(
             f"| {t['task_id']} | {t['domain']} | {sites} | "
             f"{pk_vals} | {t['best_score']:.2f} | {t['checkpoint_score']:.2f} | "
-            f"{t['avg_steps']:.0f} | {preview} |"
+            f"{t['avg_steps']:.0f} | {abort_label} | {preview} |"
         )
     return (
         "## Per-task Results\n\n"

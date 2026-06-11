@@ -18,8 +18,9 @@ from pathlib import Path
 
 import httpx
 from browser_use import Agent, Browser, ChatOpenAI
-from browser_use.tools.service import Tools
+from browser_use.llm.exceptions import ModelProviderError, ModelRateLimitError
 from browser_use.llm.views import ChatInvokeCompletion, ChatInvokeUsage
+from browser_use.tools.service import Tools
 from playwright.async_api import async_playwright
 from typing import Any
 
@@ -335,6 +336,8 @@ def _usage_from_payload(payload: Any) -> ChatInvokeUsage | None:
 
     prompt_details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details")
     prompt_cached_tokens = usage.get("prompt_cached_tokens")
+    if prompt_cached_tokens is None:
+        prompt_cached_tokens = usage.get("cached_content_token_count")
     if prompt_cached_tokens is None and isinstance(prompt_details, dict):
         prompt_cached_tokens = prompt_details.get("cached_tokens")
 
@@ -392,6 +395,76 @@ def _float_env(*names: str) -> float | None:
         except ValueError:
             continue
     return None
+
+
+def _int_env(*names: str) -> int | None:
+    for name in names:
+        raw = os.environ.get(name)
+        if raw is None or not raw.strip():
+            continue
+        try:
+            return int(raw)
+        except ValueError:
+            continue
+    return None
+
+
+def _is_gemini_model(model_name: str) -> bool:
+    return "gemini" in model_name.lower()
+
+
+def _split_api_keys(*values: str | None) -> list[str]:
+    keys: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        if raw is None:
+            continue
+        text = raw.strip()
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, list):
+                    parts = [str(item) for item in parsed]
+                else:
+                    parts = [text]
+            except json.JSONDecodeError:
+                parts = [text]
+        else:
+            parts = [text]
+
+        for value in parts:
+            value = re.sub(r"^[\[\(]\s*|\s*[\]\)]$", "", value.strip())
+            for part in re.split(r"[\s,;]+", value):
+                key = part.strip().strip('"').strip("'").strip()
+                key = key.strip("[]()")
+                if not key or key in seen:
+                    continue
+                keys.append(key)
+                seen.add(key)
+    return keys
+
+
+def _api_keys_for_model(model_name: str) -> list[str]:
+    """Return API keys for this model without exposing secrets in outputs.
+
+    Gemini runs may use multiple keys. Non-Gemini runs keep the historical
+    single-key behavior even if LLM_API_KEYS is set.
+    """
+    if _is_gemini_model(model_name):
+        keys = _split_api_keys(os.environ.get("GEMINI_API_KEYS"))
+        if not keys:
+            keys = _split_api_keys(os.environ.get("LLM_API_KEYS"))
+        if not keys:
+            keys = _split_api_keys(os.environ.get("LLM_API_KEY"))
+    else:
+        keys = _split_api_keys(os.environ.get("LLM_API_KEY"), os.environ.get("LLM_API_KEYS"))[:1]
+
+    if not keys:
+        raise RuntimeError(
+            "No LLM API key configured. Set LLM_API_KEY, or for Gemini set "
+            "LLM_API_KEYS/GEMINI_API_KEYS in .env."
+        )
+    return keys
 
 
 def _pricing_for_model(model_name: str) -> _ModelPricing | None:
@@ -494,8 +567,61 @@ def _empty_llm_stats(model_name: str) -> dict:
         "pricing": _pricing_to_dict(pricing),
         "priced_call_count": 0,
         "unpriced_call_count": 0,
+        "api_key_count": len(_api_keys_for_model(model_name)),
+        "llm_api_failure_count": 0,
+        "llm_api_abort": None,
         "calls": [],
     }
+
+
+class _LLMApiAbortError(RuntimeError):
+    """Raised after repeated provider/API failures so SaaS-Bench can stop a task."""
+
+
+_API_ABORT_STATUS_CODES = {401, 402, 403, 408, 409, 429, 500, 502, 503, 504}
+_API_ABORT_PHRASES = (
+    "resource_exhausted",
+    "quota",
+    "rate limit",
+    "rate_limit",
+    "too many requests",
+    "spending cap",
+    "insufficient credit",
+    "insufficient quota",
+    "server error",
+    "service unavailable",
+    "gateway",
+    "connection error",
+    "timeout",
+)
+_MODEL_OUTPUT_ERROR_PHRASES = (
+    "validation error",
+    "invalid model output",
+    "failed to parse structured output",
+    "could not parse response",
+    "model_validate_json",
+    "jsondecodeerror",
+)
+
+
+def _is_retryable_llm_api_error(exc: Exception) -> bool:
+    if isinstance(exc, _LLMApiAbortError):
+        return True
+
+    message = str(getattr(exc, "message", exc)).lower()
+    if any(phrase in message for phrase in _MODEL_OUTPUT_ERROR_PHRASES):
+        return False
+
+    if isinstance(exc, ModelRateLimitError):
+        return True
+
+    if isinstance(exc, ModelProviderError):
+        status_code = getattr(exc, "status_code", None)
+        if status_code in _API_ABORT_STATUS_CODES:
+            return True
+        return any(phrase in message for phrase in _API_ABORT_PHRASES)
+
+    return False
 
 
 
@@ -518,11 +644,19 @@ class _CleanOutputChatOpenAI(ChatOpenAI):
          clean it, rewrite banned actions, then validate ourselves.
     """
 
+    api_keys: list[str] | None = None
+    api_abort_threshold: int = 3
+
     def __post_init__(self):
         self.request_ids: list[str | None] = []
         self.llm_call_records: list[dict] = []
         self._llm_call_count = 0
         self._pricing = _pricing_for_model(str(self.model))
+        self._api_keys = list(self.api_keys or ([self.api_key] if self.api_key else []))
+        self._api_key_index = 0
+        self._llm_api_failure_count = 0
+        self._consecutive_llm_api_failures = 0
+        self._llm_api_abort: dict | None = None
         # Build a single reusable httpx.AsyncClient with the capture hook so
         # get_client() returns the same transport every call within this instance.
         self._http_client = httpx.AsyncClient(
@@ -534,6 +668,50 @@ class _CleanOutputChatOpenAI(ChatOpenAI):
     async def aclose(self) -> None:
         await self._http_client.aclose()
 
+    def _next_api_key_index(self) -> int | None:
+        if not self._api_keys:
+            return None
+        idx = self._api_key_index % len(self._api_keys)
+        self._api_key_index = (idx + 1) % len(self._api_keys)
+        self.api_key = self._api_keys[idx]
+        return idx
+
+    def _attempts_per_call(self) -> int:
+        if _is_gemini_model(str(self.model)) and len(self._api_keys) > 1:
+            return len(self._api_keys)
+        return 1
+
+    def _record_api_success(self) -> None:
+        self._consecutive_llm_api_failures = 0
+
+    def _record_api_failure(
+        self,
+        exc: Exception,
+        *,
+        call_no: int,
+        call_mode: str,
+        key_index: int | None,
+    ) -> None:
+        self._llm_api_failure_count += 1
+        self._consecutive_llm_api_failures += 1
+        if self._consecutive_llm_api_failures >= self.api_abort_threshold:
+            self._llm_api_abort = {
+                "reason": f"{type(exc).__name__}: {str(exc)[:500]}",
+                "threshold": self.api_abort_threshold,
+                "consecutive_failures": self._consecutive_llm_api_failures,
+                "failure_count": self._llm_api_failure_count,
+                "call": call_no,
+                "mode": call_mode,
+                "api_key_index": key_index,
+                "api_key_count": len(self._api_keys),
+            }
+
+    def should_abort_task(self) -> bool:
+        return self._llm_api_abort is not None
+
+    def api_abort_summary(self) -> dict | None:
+        return dict(self._llm_api_abort) if self._llm_api_abort else None
+
     async def _invoke_and_record(
         self,
         messages,
@@ -541,22 +719,55 @@ class _CleanOutputChatOpenAI(ChatOpenAI):
         call_mode: str,
         **kwargs,
     ) -> tuple[ChatInvokeCompletion, dict]:
-        self._llm_call_count += 1
-        call_no = self._llm_call_count
-        _current_request_id.set(None)
-        _current_response_usage.set(None)
+        last_exc: Exception | None = None
+        attempts = self._attempts_per_call()
 
-        error: str | None = None
-        result: ChatInvokeCompletion | None = None
-        try:
-            result = await super().ainvoke(messages, output_format=output_format, **kwargs)
-            return result, self._record_call(call_no, call_mode, result.usage, None)
-        except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
-            raise
-        finally:
-            if result is None:
-                self._record_call(call_no, call_mode, _current_response_usage.get(), error)
+        for attempt in range(attempts):
+            key_index = self._next_api_key_index()
+            self._llm_call_count += 1
+            call_no = self._llm_call_count
+            _current_request_id.set(None)
+            _current_response_usage.set(None)
+
+            try:
+                result = await super().ainvoke(messages, output_format=output_format, **kwargs)
+                self._record_api_success()
+                return result, self._record_call(
+                    call_no,
+                    call_mode,
+                    result.usage,
+                    None,
+                    key_index,
+                )
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                self._record_call(
+                    call_no,
+                    call_mode,
+                    _current_response_usage.get(),
+                    error,
+                    key_index,
+                )
+
+                if _is_retryable_llm_api_error(exc):
+                    self._record_api_failure(
+                        exc,
+                        call_no=call_no,
+                        call_mode=call_mode,
+                        key_index=key_index,
+                    )
+                    last_exc = exc
+                    if self.should_abort_task():
+                        raise _LLMApiAbortError(
+                            "LLM API abort threshold reached after "
+                            f"{self._consecutive_llm_api_failures} consecutive provider failures"
+                        ) from exc
+                    if attempt < attempts - 1:
+                        continue
+                raise
+
+        assert last_exc is not None
+        raise last_exc
 
     def _record_call(
         self,
@@ -564,6 +775,7 @@ class _CleanOutputChatOpenAI(ChatOpenAI):
         call_mode: str,
         usage: ChatInvokeUsage | None,
         error: str | None,
+        key_index: int | None,
     ) -> dict:
         if usage is None:
             usage = _current_response_usage.get()
@@ -575,6 +787,9 @@ class _CleanOutputChatOpenAI(ChatOpenAI):
             "request_id": _current_request_id.get(),
             "spending_usd": round(spending, 8) if spending is not None else None,
         }
+        if key_index is not None and len(self._api_keys) > 1:
+            record["api_key_index"] = key_index
+            record["api_key_count"] = len(self._api_keys)
         if usage_dict is not None:
             record.update(usage_dict)
         if error:
@@ -618,6 +833,9 @@ class _CleanOutputChatOpenAI(ChatOpenAI):
             "pricing": _pricing_to_dict(self._pricing),
             "priced_call_count": priced_call_count,
             "unpriced_call_count": usage_call_count - priced_call_count,
+            "api_key_count": len(self._api_keys),
+            "llm_api_failure_count": self._llm_api_failure_count,
+            "llm_api_abort": self.api_abort_summary(),
             "calls": self.llm_call_records,
         }
         if requested_model and requested_model != str(self.model):
@@ -650,7 +868,9 @@ class _CleanOutputChatOpenAI(ChatOpenAI):
                 usage=result.usage,
                 stop_reason=result.stop_reason,
             )
-        except Exception:
+        except Exception as exc:
+            if isinstance(exc, _LLMApiAbortError) or _is_retryable_llm_api_error(exc):
+                raise
             # Fall through to recovery: re-fetch as raw string and clean.
             pass
 
@@ -673,11 +893,16 @@ class _CleanOutputChatOpenAI(ChatOpenAI):
 
 
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL")
-LLM_API_KEY  = os.environ.get("LLM_API_KEY")
-if not (LLM_BASE_URL and LLM_API_KEY):
+LLM_API_KEY = os.environ.get("LLM_API_KEY")
+if not LLM_BASE_URL:
     raise RuntimeError(
-        "LLM_BASE_URL and LLM_API_KEY must be set in the environment "
+        "LLM_BASE_URL must be set in the environment "
         "(see .env.example for the expected variables)."
+    )
+if not (LLM_API_KEY or os.environ.get("LLM_API_KEYS") or os.environ.get("GEMINI_API_KEYS")):
+    raise RuntimeError(
+        "Set LLM_API_KEY, or for Gemini set LLM_API_KEYS/GEMINI_API_KEYS "
+        "in the environment (see .env.example)."
     )
 
 
@@ -815,12 +1040,19 @@ def _build_llm(model_name: str) -> _CleanOutputChatOpenAI:
     kwargs: dict = {}
     if reasoning_effort is not None:
         kwargs["reasoning_effort"] = reasoning_effort
+    api_keys = _api_keys_for_model(model_name)
+    abort_threshold = _int_env("LLM_API_ABORT_RETRIES", "GEMINI_API_ABORT_RETRIES")
+    if abort_threshold is None:
+        abort_threshold = max(3, len(api_keys)) if _is_gemini_model(model_name) else 3
+    abort_threshold = max(1, abort_threshold)
     return _CleanOutputChatOpenAI(
         model=model_name,
         base_url=LLM_BASE_URL,
-        api_key=LLM_API_KEY,
+        api_key=api_keys[0],
+        api_keys=api_keys,
+        api_abort_threshold=abort_threshold,
         timeout=600,
-        max_retries=5,
+        max_retries=0 if _is_gemini_model(model_name) else 5,
         dont_force_structured_output=True,
         add_schema_to_system_prompt=True,
         frequency_penalty=None,
@@ -943,6 +1175,14 @@ def _extract_trajectory(history, request_ids: list[str | None] | None = None) ->
     return steps
 
 
+def _task_index_label(task_index: int | None, task_count: int | None = None) -> str:
+    if task_index is None:
+        return "task_index=?"
+    if task_count is None:
+        return f"task_index={task_index}"
+    return f"task_index={task_index} ({task_index + 1}/{task_count})"
+
+
 async def run_task(
     task: dict,
     model_name: str,
@@ -953,6 +1193,8 @@ async def run_task(
     todo_md: str | None = None,
     run_idx: int | None = None,
     input_files: list[str] | None = None,
+    task_index: int | None = None,
+    task_count: int | None = None,
 ) -> dict:
     """Run one task with browser-use. Returns result dict."""
     task_id = task["task_id"]
@@ -999,24 +1241,53 @@ async def run_task(
             llm_timeout=150,
         )
 
-        history = await agent.run(max_steps=max_steps)
+        abort_reported = False
+
+        async def _stop_on_llm_api_abort(running_agent) -> None:
+            nonlocal abort_reported
+            if llm is None or not llm.should_abort_task():
+                return
+            if not abort_reported:
+                abort = llm.api_abort_summary() or {}
+                print(
+                    f"  {tag}[{_task_index_label(task_index, task_count)}] "
+                    "LLM API abort: "
+                    f"{abort.get('consecutive_failures', '?')} consecutive failures "
+                    f"(threshold={abort.get('threshold', '?')}); "
+                    f"last={str(abort.get('reason', ''))[:200]}",
+                    flush=True,
+                )
+                abort_reported = True
+            running_agent.stop()
+
+        history = await agent.run(max_steps=max_steps, on_step_end=_stop_on_llm_api_abort)
         raw = history.final_result() or ""
         output = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
 
         trajectory = _extract_trajectory(history, request_ids=llm.request_ids)
+        abort_summary = llm.api_abort_summary()
 
         result = {
             "task_id": task_id,
-            "status": "completed",
+            "status": "llm_api_abort" if abort_summary else "completed",
             "agent_output": output,
             "trajectory": trajectory,
             "llm_stats": llm.usage_summary(requested_model=model_name),
         }
+        if task_index is not None:
+            result["task_index"] = task_index
+            result["task_ordinal"] = task_index + 1
+            if task_count is not None:
+                result["task_count"] = task_count
+        if abort_summary:
+            result["llm_api_abort"] = abort_summary
+            result["error_steps"] = [abort_summary.get("reason", "LLM API abort")]
 
     except Exception as e:
+        abort_summary = llm.api_abort_summary() if llm is not None else None
         result = {
             "task_id": task_id,
-            "status": "error",
+            "status": "llm_api_abort" if abort_summary else "error",
             "agent_output": "",
             "trajectory": [],
             "error_steps": [str(e)],
@@ -1026,6 +1297,13 @@ async def run_task(
                 else _empty_llm_stats(model_name)
             ),
         }
+        if task_index is not None:
+            result["task_index"] = task_index
+            result["task_ordinal"] = task_index + 1
+            if task_count is not None:
+                result["task_count"] = task_count
+        if abort_summary:
+            result["llm_api_abort"] = abort_summary
 
     finally:
         await _kill(chrome_proc, browser)
