@@ -140,11 +140,11 @@ MODEL="${LLM_MODEL}"
 WORKERS=8
 MAX_STEPS=400
 HOSTNAME_VAL="localhost"
-RESULT_DIR="${REPO_ROOT}/results-subset"
+RESULT_DIR="${REPO_ROOT}/results-subset-v1"
 APPS_YAML="${REPO_ROOT}/saas_bench/apps.yaml"
 NO_ISOLATION=""
 TASK_IDS_FILE=""
-LOG_FILE="gfull2.log"
+LOG_FILE="modify-gfull.log"
 RERUN_EXISTING=""
 
 # -- Argument parsing --------------------------------------------------------
@@ -263,6 +263,7 @@ echo ""
 CMD=(
     "$PYTHON" -m saas_bench.run
     --tasks-dir   "$TASKS_DIR"
+    --task-ids   "task_ids_21.txt"
     --model       "$MODEL"
     --workers     "$WORKERS"
     --max-steps   "$MAX_STEPS"

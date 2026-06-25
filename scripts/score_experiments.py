@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
+import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -85,6 +86,19 @@ def load_json(path: Path) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+def load_task_ids_file(path: Path) -> list[str]:
+    if not path.is_file():
+        raise FileNotFoundError(f"Task ids file does not exist: {path}")
+
+    task_ids: list[str] = []
+    for line in path.read_text().splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        task_ids.extend(line.replace(",", " ").split())
+    return task_ids
+
+
 def parse_verify_name(path: Path) -> ArtifactKey | None:
     stem = path.stem
     if not stem.endswith("_verify"):
@@ -119,20 +133,6 @@ def has_result_artifacts(path: Path) -> bool:
         if parse_verify_name(child) or parse_agent_name(child):
             return True
     return False
-
-
-def discover_default_experiments() -> list[Path]:
-    roots = [Path("results"), Path("results-subset")]
-    experiments: list[Path] = []
-    for root in roots:
-        if not root.is_dir():
-            continue
-        if has_result_artifacts(root):
-            experiments.append(root)
-        for child in sorted(root.iterdir()):
-            if child.is_dir() and has_result_artifacts(child):
-                experiments.append(child)
-    return experiments
 
 
 def expand_experiment_dirs(paths: list[Path | str]) -> list[Path]:
@@ -285,10 +285,15 @@ def checkpoint_score(records: list[RunRecord]) -> float:
     return earned / total
 
 
-def score_experiment(path: Path, count_missing_as_zero: bool = False) -> dict[str, Any]:
+def score_experiment(
+    path: Path,
+    count_missing_as_zero: bool = False,
+    task_ids: list[str] | None = None,
+) -> dict[str, Any]:
     verify_by_key: dict[ArtifactKey, dict[str, Any]] = {}
     agent_by_key: dict[ArtifactKey, dict[str, Any]] = {}
     unreadable: list[str] = []
+    task_id_filter = set(task_ids or [])
 
     for child in sorted(path.iterdir()) if path.is_dir() else []:
         if child.suffix != ".json":
@@ -296,6 +301,9 @@ def score_experiment(path: Path, count_missing_as_zero: bool = False) -> dict[st
         verify_key = parse_verify_name(child)
         agent_key = parse_agent_name(child)
         if not verify_key and not agent_key:
+            continue
+        artifact_key = verify_key or agent_key
+        if task_id_filter and artifact_key and artifact_key.task_id not in task_id_filter:
             continue
 
         data = load_json(child)
@@ -320,6 +328,7 @@ def score_experiment(path: Path, count_missing_as_zero: bool = False) -> dict[st
         )
         for key in keys
     ]
+    discovered_task_ids = {record.task_id for record in records}
 
     summary = load_json(path / "summary.json") if path.is_dir() else None
     meta = metadata_from_summary(summary)
@@ -450,6 +459,11 @@ def score_experiment(path: Path, count_missing_as_zero: bool = False) -> dict[st
         "by_domain": by_domain,
         "llm_usage": llm_usage(agent_records),
         "tasks": task_rows,
+        "selected_task_ids": task_ids if task_id_filter else None,
+        "missing_selected_task_ids": [
+            task_id for task_id in (task_ids or [])
+            if task_id not in discovered_task_ids
+        ] if task_id_filter else [],
         "unreadable_json": unreadable,
     }
 
@@ -546,6 +560,12 @@ def format_text(results: list[dict[str, Any]], checks: str) -> str:
             current = result["overall"]["tasks_discovered"]
             suffix = " (differs from current artifacts)" if result["summary_total"] != current else ""
             parts.append(f"existing_summary_total: {result['summary_total']}{suffix}")
+        if result.get("selected_task_ids"):
+            missing = result.get("missing_selected_task_ids") or []
+            suffix = f" | missing={len(missing)}" if missing else ""
+            parts.append(
+                f"selected_tasks: {len(result['selected_task_ids'])} requested{suffix}"
+            )
 
         parts.append(
             "tasks: "
@@ -653,6 +673,7 @@ def parse_args() -> argparse.Namespace:
         "dirs",
         nargs="*",
         type=Path,
+        default=[Path("results"), Path("results-subset"), Path("results-subset-v1")],
         help=(
             "Experiment result directories. If omitted, immediate experiments under "
             "results/ and results-subset/ are scored. If a supplied directory has no "
@@ -678,19 +699,40 @@ def parse_args() -> argparse.Namespace:
             "By default, missing verifier runs are reported but excluded from scoring."
         ),
     )
+    parser.add_argument(
+        "--task-ids",
+        dest="task_ids_file",
+        type=Path,
+        default=Path("task_ids_21.txt"),
+        help=(
+            "Optional file of task ids to include in scoring. Blank lines and # "
+            "comments are ignored; comma or whitespace separated ids are accepted. "
+            "If the file has no ids, no task filter is applied."
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    requested = args.dirs or discover_default_experiments()
+    try:
+        task_ids = load_task_ids_file(args.task_ids_file) if args.task_ids_file else []
+    except OSError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    requested = args.dirs
     experiments = expand_experiment_dirs(requested)
     if not experiments:
         print("No experiment directories with result artifacts were found.")
         return 1
 
     results = [
-        score_experiment(path, count_missing_as_zero=args.count_missing_as_zero)
+        score_experiment(
+            path,
+            count_missing_as_zero=args.count_missing_as_zero,
+            task_ids=task_ids,
+        )
         for path in experiments
     ]
     if args.json:
